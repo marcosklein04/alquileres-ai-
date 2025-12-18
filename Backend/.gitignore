@@ -1,0 +1,18 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Env
+.env
+
+# DB local
+*.db
+
+# Mac
+.DS_Store
+__MACOSX/
+
+# Node (si después hay frontend)
+node_modules/
