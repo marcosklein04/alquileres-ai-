@@ -2,6 +2,7 @@ import os
 import sqlite3
 import pymysql
 from dotenv import load_dotenv
+from datetime import date, datetime
 
 import pymysql
 
@@ -63,8 +64,6 @@ def listar_contratos_bd():
     conn.close()
     return [dict(r) for r in rows]
 
-from datetime import date
-
 def listar_contratos_bd():
     conn = get_db_connection()
     cur = conn.cursor()
@@ -107,3 +106,78 @@ def listar_contratos_bd():
         })
 
     return items
+
+def listar_contratos_por_notificar_60d():
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Trae contratos activos NO notificados aún
+    ejecutar(
+        cur,
+        """
+        SELECT id, inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin,
+               dias_aviso, decision_renovacion, email_inquilino, email_propietario, notificado_60d
+        FROM contratos
+        WHERE estado='ACTIVO' AND notificado_60d=0
+        ORDER BY fecha_fin ASC
+        """,
+        """
+        SELECT id, inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin,
+               dias_aviso, decision_renovacion, email_inquilino, email_propietario, notificado_60d
+        FROM contratos
+        WHERE estado='ACTIVO' AND notificado_60d=0
+        ORDER BY fecha_fin ASC
+        """,
+        ()
+    )
+
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    hoy = date.today()
+    out = []
+
+    for r in rows:
+        fin = r["fecha_fin"]
+        dias = (fin - hoy).days if fin else None
+        umbral = r.get("dias_aviso", 60) if isinstance(r, dict) else 60
+
+        requiere = dias is not None and 0 <= dias <= int(umbral)
+
+        if requiere:
+            out.append({
+                "id": r["id"],
+                "inmobiliaria": r["inmobiliaria"],
+                "inquilino": r["inquilino"],
+                "propietario": r["propietario"],
+                "fecha_inicio": str(r["fecha_inicio"]) if r["fecha_inicio"] else None,
+                "fecha_fin": str(r["fecha_fin"]) if r["fecha_fin"] else None,
+                "dias_aviso": int(umbral),
+                "dias_restantes": dias,
+                "decision_renovacion": r["decision_renovacion"],
+                "email_inquilino": r.get("email_inquilino"),
+                "email_propietario": r.get("email_propietario"),
+            })
+
+    return out
+
+
+def marcar_notificado_60d(contrato_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    ejecutar(
+        cur,
+        "UPDATE contratos SET notificado_60d=1, notificado_60d_at=NOW() WHERE id=%s",
+        "UPDATE contratos SET notificado_60d=1, notificado_60d_at=datetime('now') WHERE id=?",
+        (contrato_id,)
+    )
+
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+    cur.close()
+    conn.close()

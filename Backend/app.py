@@ -1,6 +1,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, date
+from mailer import send_email
 
 from db import get_db_connection, DB_ENGINE
 
@@ -320,6 +321,81 @@ def alertas_contratos_por_vencer():
     }), 200
 
 
+
+from datetime import datetime, date
+
+@app.route("/api/notifications/run-60d", methods=["POST"])
+def run_notifications_60d():
+    """
+    Busca contratos que estén a <= 60 días de vencer,
+    que tengan email, y que todavía no estén marcados como notificados.
+    Por ahora: marca notificado_60d=1 y guarda notificado_60d_at.
+    (Luego enchufamos envío real por Gmail.)
+    """
+    umbral = 60
+    hoy = date.today()
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Traer candidatos (no notificados, con fecha_fin, con al menos un email)
+    cur.execute("""
+        SELECT id, inquilino, propietario, fecha_fin, email_inquilino, email_propietario, notificado_60d
+        FROM contratos
+        WHERE fecha_fin IS NOT NULL
+          AND notificado_60d = 0
+          AND (email_inquilino IS NOT NULL OR email_propietario IS NOT NULL)
+        ORDER BY fecha_fin ASC
+    """)
+    rows = cur.fetchall()
+
+    enviados = []
+    saltados = []
+
+    for r in rows:
+        fin = r["fecha_fin"]
+        dias = (fin - hoy).days if fin else None
+
+        if dias is None:
+            saltados.append({"id": r["id"], "motivo": "sin_fecha_fin"})
+            continue
+
+        if not (0 <= dias <= umbral):
+            saltados.append({"id": r["id"], "motivo": f"fuera_de_umbral ({dias})"})
+            continue
+
+        # Aca luego va el envío real de mail.
+        # Por ahora, marcamos como notificado:
+        ejecutar(
+            cur,
+            "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",
+            "UPDATE contratos SET notificado_60d = ?, notificado_60d_at = ? WHERE id = ?",
+            (1, datetime.now(), r["id"])
+        )
+
+        enviados.append({
+            "id": r["id"],
+            "dias_restantes": dias,
+            "email_inquilino": r["email_inquilino"],
+            "email_propietario": r["email_propietario"],
+        })
+
+    try:
+        conn.commit()
+    except Exception:
+        pass
+
+    cur.close()
+    conn.close()
+
+    return jsonify({
+        "ok": True,
+        "umbral_dias": umbral,
+        "notificados": enviados,
+        "saltados": saltados,
+        "total_notificados": len(enviados)
+    }), 200
+
 if __name__ == "__main__":
     app.run(debug=True)
-    app.run(host="127.0.0.1", port=5000, debug=True)
+    app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
