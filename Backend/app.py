@@ -1,17 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from datetime import datetime, date
-from mailer import send_email
 
-from db import get_db_connection, DB_ENGINE
+from db import get_db_connection, DB_ENGINE, listar_contratos_bd
 
 app = Flask(__name__)
 CORS(app)
-
-
-@app.route("/api/ping", methods=["GET"])
-def ping():
-    return jsonify({"message": "pong"}), 200
 
 
 def ejecutar(cur, sql_mysql, sql_sqlite, params):
@@ -22,19 +16,34 @@ def ejecutar(cur, sql_mysql, sql_sqlite, params):
 
 
 # =========================
+# DEBUG: listar rutas
+# =========================
+@app.route("/api/routes", methods=["GET"])
+def routes():
+    rules = []
+    for r in sorted(app.url_map.iter_rules(), key=lambda x: str(x)):
+        rules.append({"rule": str(r), "methods": sorted([m for m in r.methods if m not in ("HEAD", "OPTIONS")])})
+    return jsonify({"routes": rules, "total": len(rules)}), 200
+
+
+@app.route("/api/ping", methods=["GET"])
+def ping():
+    return jsonify({"message": "pong"}), 200
+
+
+# =========================
 # POST /api/contracts
 # =========================
 @app.route("/api/contracts", methods=["POST"])
 def crear_contrato():
     from ai import extraer_datos_contrato
 
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     texto_contrato = data.get("texto_contrato")
 
     if not texto_contrato:
         return jsonify({"error": "Falta texto_contrato"}), 400
 
-    # defaults
     res = {"ok": False, "model": None, "raw": None, "data": {}}
     extraidos = {
         "inmobiliaria": None,
@@ -44,14 +53,12 @@ def crear_contrato():
         "fecha_fin": None,
     }
 
-    # 1) IA
     try:
         res = extraer_datos_contrato(texto_contrato) or res
         extraidos = res.get("data") or extraidos
     except Exception as e:
-        print("❌ Error IA (excepción):", repr(e))
+        print("❌ Error IA:", repr(e))
 
-    # 2) Validación
     if (not res.get("ok")) or all(
         extraidos.get(k) is None
         for k in ["inmobiliaria", "inquilino", "propietario", "fecha_inicio", "fecha_fin"]
@@ -62,19 +69,16 @@ def crear_contrato():
             "ia_modelo": res.get("model"),
         }), 422
 
-    # 3) Insert
     conn = get_db_connection()
     cur = conn.cursor()
 
     sql_mysql = """
-        INSERT INTO contratos (
-            inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin
-        ) VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO contratos (inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin)
+        VALUES (%s, %s, %s, %s, %s)
     """
     sql_sqlite = """
-        INSERT INTO contratos (
-            inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin
-        ) VALUES (?, ?, ?, ?, ?)
+        INSERT INTO contratos (inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin)
+        VALUES (?, ?, ?, ?, ?)
     """
     params = (
         extraidos.get("inmobiliaria"),
@@ -85,11 +89,7 @@ def crear_contrato():
     )
 
     ejecutar(cur, sql_mysql, sql_sqlite, params)
-
-    try:
-        conn.commit()
-    except Exception:
-        pass
+    conn.commit()
 
     contrato_id = cur.lastrowid
     cur.close()
@@ -105,7 +105,6 @@ def crear_contrato():
 
 # =========================
 # GET /api/contracts
-# (listado simple + dias_restantes/por_vencer)
 # =========================
 @app.route("/api/contracts", methods=["GET"])
 def listar_contratos():
@@ -118,8 +117,8 @@ def listar_contratos():
         FROM contratos
         ORDER BY fecha_fin ASC
     """)
-
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
@@ -127,18 +126,7 @@ def listar_contratos():
     contratos = []
 
     for r in rows:
-        fin_raw = r["fecha_fin"]
-        fin = None
-
-        if fin_raw:
-            if isinstance(fin_raw, date):
-                fin = fin_raw
-            else:
-                try:
-                    fin = datetime.strptime(str(fin_raw), "%Y-%m-%d").date()
-                except ValueError:
-                    fin = None
-
+        fin = r["fecha_fin"] if isinstance(r["fecha_fin"], date) else None
         dias_restantes = (fin - hoy).days if fin else None
         por_vencer = dias_restantes is not None and 0 <= dias_restantes <= 60
 
@@ -162,7 +150,7 @@ def listar_contratos():
 # =========================
 @app.route("/api/contracts/<int:contrato_id>/renewal", methods=["PATCH"])
 def actualizar_renovacion(contrato_id):
-    data = request.get_json() or {}
+    data = request.get_json(silent=True) or {}
     decision = data.get("decision")
 
     if decision not in ["RENUEVA", "NO_RENUEVA"]:
@@ -177,11 +165,7 @@ def actualizar_renovacion(contrato_id):
         "UPDATE contratos SET decision_renovacion = ? WHERE id = ?",
         (decision, contrato_id)
     )
-
-    try:
-        conn.commit()
-    except Exception:
-        pass
+    conn.commit()
 
     cur.close()
     conn.close()
@@ -190,61 +174,18 @@ def actualizar_renovacion(contrato_id):
 
 
 # =========================
-# POST /api/contracts/manual
+# Helpers estado contrato
 # =========================
-@app.route("/api/contracts/manual", methods=["POST"])
-def crear_contrato_manual():
-    data = request.get_json() or {}
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    sql_mysql = """
-        INSERT INTO contratos (
-            inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin, dias_aviso
-        ) VALUES (%s, %s, %s, %s, %s, %s)
-    """
-    sql_sqlite = """
-        INSERT INTO contratos (
-            inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin, dias_aviso
-        ) VALUES (?, ?, ?, ?, ?, ?)
-    """
-    params = (
-        data.get("inmobiliaria"),
-        data.get("inquilino"),
-        data.get("propietario"),
-        data.get("fecha_inicio"),
-        data.get("fecha_fin"),
-        data.get("dias_aviso", 60),
-    )
-
-    ejecutar(cur, sql_mysql, sql_sqlite, params)
-
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
-    contrato_id = cur.lastrowid
-    cur.close()
-    conn.close()
-
-    return jsonify({"id": contrato_id}), 201
-
-
-# =========================
-# Helpers para "estado"
-# =========================
-def _parse_iso_date(d: str | None):
+def _parse_iso_date(d):
     if not d:
         return None
     try:
-        return datetime.strptime(d, "%Y-%m-%d").date()
+        return datetime.strptime(str(d), "%Y-%m-%d").date()
     except ValueError:
         return None
 
 
-def _estado_contrato(fecha_fin_iso: str | None, umbral_dias: int = 60):
+def _estado_contrato(fecha_fin_iso, umbral_dias=60):
     hoy = date.today()
     fin = _parse_iso_date(fecha_fin_iso)
 
@@ -262,7 +203,6 @@ def _estado_contrato(fecha_fin_iso: str | None, umbral_dias: int = 60):
 
 # =========================
 # GET /api/contracts/list
-# (listado enriquecido + filtros)
 # =========================
 @app.route("/api/contracts/list", methods=["GET"])
 def listar_contratos_enriquecidos():
@@ -274,10 +214,7 @@ def listar_contratos_enriquecidos():
 
     only = request.args.get("only")  # por_vencer | vigente | vencido | sin_fecha_fin
 
-    # Opción A: seguir como lo tenías (db.py trae lista de dicts)
-    from db import listar_contratos_bd
-
-    contratos = listar_contratos_bd()
+    contratos = listar_contratos_bd()  # lista de dicts
 
     items = []
     for c in contratos:
@@ -287,58 +224,20 @@ def listar_contratos_enriquecidos():
             continue
         items.append(item)
 
-    return jsonify({"items": items, "umbral_dias": umbral}), 200
-
-@app.route("/api/alerts/contracts", methods=["GET"])
-def alertas_contratos_por_vencer():
-    # configurable: /api/alerts/contracts?umbral=60
-    umbral = request.args.get("umbral", default="60")
-    try:
-        umbral = int(umbral)
-    except ValueError:
-        umbral = 60
-
-    from db import listar_contratos_bd  # debe devolver lista de dicts
-
-    contratos = listar_contratos_bd()
-
-    alertas = []
-    for c in contratos:
-        # si ya se decidió, no avisar
-        # solo alertar si sigue pendiente
-        if c.get("decision_renovacion") not in (None, "PENDIENTE"):
-            continue
-
-        calc = _estado_contrato(c.get("fecha_fin"), umbral_dias=umbral)
-
-        if calc.get("estado") == "por_vencer" and calc.get("requiere_aviso_60d") is True:
-            alertas.append({**c, **calc})
-
-    return jsonify({
-        "items": alertas,
-        "umbral_dias": umbral,
-        "total": len(alertas)
-    }), 200
+    return jsonify({"items": items, "umbral_dias": umbral, "total": len(items)}), 200
 
 
-
-from datetime import datetime, date
-
+# =========================
+# POST /api/notifications/run-60d
+# =========================
 @app.route("/api/notifications/run-60d", methods=["POST"])
 def run_notifications_60d():
-    """
-    Busca contratos que estén a <= 60 días de vencer,
-    que tengan email, y que todavía no estén marcados como notificados.
-    Por ahora: marca notificado_60d=1 y guarda notificado_60d_at.
-    (Luego enchufamos envío real por Gmail.)
-    """
     umbral = 60
     hoy = date.today()
 
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Traer candidatos (no notificados, con fecha_fin, con al menos un email)
     cur.execute("""
         SELECT id, inquilino, propietario, fecha_fin, email_inquilino, email_propietario, notificado_60d
         FROM contratos
@@ -349,7 +248,7 @@ def run_notifications_60d():
     """)
     rows = cur.fetchall()
 
-    enviados = []
+    notificados = []
     saltados = []
 
     for r in rows:
@@ -364,8 +263,8 @@ def run_notifications_60d():
             saltados.append({"id": r["id"], "motivo": f"fuera_de_umbral ({dias})"})
             continue
 
-        # Aca luego va el envío real de mail.
-        # Por ahora, marcamos como notificado:
+        # TODO: acá luego llamamos al envío real de email.
+        # Por ahora marcamos como notificado:
         ejecutar(
             cur,
             "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",
@@ -373,29 +272,26 @@ def run_notifications_60d():
             (1, datetime.now(), r["id"])
         )
 
-        enviados.append({
+        notificados.append({
             "id": r["id"],
             "dias_restantes": dias,
             "email_inquilino": r["email_inquilino"],
             "email_propietario": r["email_propietario"],
         })
 
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
+    conn.commit()
     cur.close()
     conn.close()
 
     return jsonify({
         "ok": True,
         "umbral_dias": umbral,
-        "notificados": enviados,
+        "total_notificados": len(notificados),
+        "notificados": notificados,
         "saltados": saltados,
-        "total_notificados": len(enviados)
     }), 200
 
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    # Un solo run, un solo puerto. Sin reloader para que no te rompa al pausar.
     app.run(host="127.0.0.1", port=5000, debug=True, use_reloader=False)
