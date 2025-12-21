@@ -3,14 +3,14 @@ from flask_cors import CORS
 from datetime import datetime, date
 
 from db import get_db_connection, DB_ENGINE
-from mailer import send_email  # SMTP (Gmail App Password, etc.)
+from mailer import send_email  # SMTP: usa SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/MAIL_FROM
 
 app = Flask(__name__)
 CORS(app)
 
 
 # =========================================================
-# Helpers DB
+# Helper SQL (mysql/sqlite placeholders)
 # =========================================================
 def ejecutar(cur, sql_mysql, sql_sqlite, params):
     if DB_ENGINE == "mysql":
@@ -19,18 +19,20 @@ def ejecutar(cur, sql_mysql, sql_sqlite, params):
         cur.execute(sql_sqlite, params)
 
 
+# =========================================================
+# Helpers fecha/estado
+# =========================================================
 def _parse_iso_date(d):
     """
-    d puede venir como:
-    - date/datetime (MySQL/PyMySQL)
-    - string ISO 'YYYY-MM-DD' (SQLite o serializado)
+    d puede ser:
+    - date/datetime (MySQL)
+    - string 'YYYY-MM-DD' (SQLite o serializado)
     - None
     """
     if not d:
         return None
 
     if isinstance(d, date):
-        # datetime también es date
         return d if not isinstance(d, datetime) else d.date()
 
     try:
@@ -39,38 +41,23 @@ def _parse_iso_date(d):
         return None
 
 
-def _estado_contrato(fecha_fin_iso: str | None, umbral_dias: int = 60):
+def _estado_contrato(fecha_fin, umbral_dias=60):
     hoy = date.today()
-    fin = _parse_iso_date(fecha_fin_iso)
+    fin = _parse_iso_date(fecha_fin)
 
     if not fin:
-        return {
-            "dias_restantes": None,
-            "estado": "sin_fecha_fin",
-            "requiere_aviso_60d": False
-        }
+        return {"dias_restantes": None, "estado": "sin_fecha_fin", "requiere_aviso_60d": False}
 
     dias = (fin - hoy).days
 
     if dias < 0:
-        return {
-            "dias_restantes": dias,
-            "estado": "vencido",
-            "requiere_aviso_60d": False
-        }
+        return {"dias_restantes": dias, "estado": "vencido", "requiere_aviso_60d": False}
 
     if dias <= umbral_dias:
-        return {
-            "dias_restantes": dias,
-            "estado": "por_vencer",
-            "requiere_aviso_60d": True
-        }
+        return {"dias_restantes": dias, "estado": "por_vencer", "requiere_aviso_60d": True}
 
-    return {
-        "dias_restantes": dias,
-        "estado": "vigente",
-        "requiere_aviso_60d": False
-    }
+    return {"dias_restantes": dias, "estado": "vigente", "requiere_aviso_60d": False}
+
 
 # =========================================================
 # Debug: listar rutas
@@ -93,7 +80,7 @@ def ping():
 
 
 # =========================================================
-# POST /api/contracts  (por IA)
+# POST /api/contracts (IA)
 # =========================================================
 @app.route("/api/contracts", methods=["POST"])
 def crear_contrato():
@@ -101,7 +88,6 @@ def crear_contrato():
 
     data = request.get_json() or {}
     texto_contrato = data.get("texto_contrato")
-
     if not texto_contrato:
         return jsonify({"error": "Falta texto_contrato"}), 400
 
@@ -120,11 +106,8 @@ def crear_contrato():
     except Exception as e:
         print("❌ Error IA:", repr(e))
 
-    # Validación: si no hay extracción, NO insertamos
-    if (not res.get("ok")) or all(
-        extraidos.get(k) is None
-        for k in ["inmobiliaria", "inquilino", "propietario", "fecha_inicio", "fecha_fin"]
-    ):
+    # si no extrajo nada, no insertamos
+    if (not res.get("ok")) or all(extraidos.get(k) is None for k in extraidos.keys()):
         return jsonify({
             "error": "La IA no pudo extraer datos del contrato. Revisar texto o API Key.",
             "ia_ok": res.get("ok"),
@@ -149,14 +132,9 @@ def crear_contrato():
         extraidos.get("fecha_inicio"),
         extraidos.get("fecha_fin"),
     )
-
     ejecutar(cur, sql_mysql, sql_sqlite, params)
 
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
+    conn.commit()
     contrato_id = cur.lastrowid
     cur.close()
     conn.close()
@@ -170,7 +148,7 @@ def crear_contrato():
 
 
 # =========================================================
-# GET /api/contracts  (listado simple)
+# GET /api/contracts (simple)
 # =========================================================
 @app.route("/api/contracts", methods=["GET"])
 def listar_contratos():
@@ -184,19 +162,18 @@ def listar_contratos():
         ORDER BY fecha_fin ASC
     """)
     rows = cur.fetchall()
-
     cur.close()
     conn.close()
 
     hoy = date.today()
-    contratos = []
+    out = []
 
     for r in rows:
         fin = _parse_iso_date(r.get("fecha_fin"))
         dias_restantes = (fin - hoy).days if fin else None
         por_vencer = dias_restantes is not None and 0 <= dias_restantes <= 60
 
-        contratos.append({
+        out.append({
             "id": r.get("id"),
             "inmobiliaria": r.get("inmobiliaria"),
             "inquilino": r.get("inquilino"),
@@ -208,7 +185,7 @@ def listar_contratos():
             "decision_renovacion": r.get("decision_renovacion"),
         })
 
-    return jsonify(contratos), 200
+    return jsonify(out), 200
 
 
 # =========================================================
@@ -232,11 +209,7 @@ def actualizar_renovacion(contrato_id):
         (decision, contrato_id),
     )
 
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -278,11 +251,7 @@ def crear_contrato_manual():
 
     ejecutar(cur, sql_mysql, sql_sqlite, params)
 
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
+    conn.commit()
     contrato_id = cur.lastrowid
     cur.close()
     conn.close()
@@ -291,7 +260,7 @@ def crear_contrato_manual():
 
 
 # =========================================================
-# GET /api/contracts/list  (enriquecido)
+# GET /api/contracts/list (enriquecido + filtro)
 # =========================================================
 @app.route("/api/contracts/list", methods=["GET"])
 def listar_contratos_enriquecidos():
@@ -307,28 +276,27 @@ def listar_contratos_enriquecidos():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin,
-               dias_aviso, decision_renovacion
+        SELECT id, inmobiliaria, inquilino, propietario,
+               fecha_inicio, fecha_fin, dias_aviso, decision_renovacion
         FROM contratos
         ORDER BY fecha_fin ASC
     """)
-    contratos = cur.fetchall()
-
+    rows = cur.fetchall()
     cur.close()
     conn.close()
 
     items = []
-    for c in contratos:
-        calc = _estado_contrato(c.get("fecha_fin"), umbral_dias=umbral)
+    for r in rows:
+        calc = _estado_contrato(r.get("fecha_fin"), umbral_dias=umbral)
         item = {
-            "id": c.get("id"),
-            "inmobiliaria": c.get("inmobiliaria"),
-            "inquilino": c.get("inquilino"),
-            "propietario": c.get("propietario"),
-            "fecha_inicio": str(c.get("fecha_inicio")) if c.get("fecha_inicio") else None,
-            "fecha_fin": str(c.get("fecha_fin")) if c.get("fecha_fin") else None,
-            "dias_aviso": c.get("dias_aviso", 60),
-            "decision_renovacion": c.get("decision_renovacion"),
+            "id": r.get("id"),
+            "inmobiliaria": r.get("inmobiliaria"),
+            "inquilino": r.get("inquilino"),
+            "propietario": r.get("propietario"),
+            "fecha_inicio": str(r.get("fecha_inicio")) if r.get("fecha_inicio") else None,
+            "fecha_fin": str(r.get("fecha_fin")) if r.get("fecha_fin") else None,
+            "dias_aviso": r.get("dias_aviso", 60),
+            "decision_renovacion": r.get("decision_renovacion"),
             **calc,
         }
         if only and item.get("estado") != only:
@@ -340,7 +308,7 @@ def listar_contratos_enriquecidos():
 
 # =========================================================
 # POST /api/notifications/run-60d
-# (envía mail y marca notificado_60d SOLO si envió OK)
+# Envía mail y marca notificado_60d solo si envía OK
 # =========================================================
 @app.route("/api/notifications/run-60d", methods=["POST"])
 def run_notifications_60d():
@@ -350,12 +318,14 @@ def run_notifications_60d():
     conn = get_db_connection()
     cur = conn.cursor()
 
+    # Nota: agrego estado='ACTIVO' para no notificar cosas dadas de baja
     cur.execute("""
         SELECT id, inquilino, propietario, fecha_fin,
                email_inquilino, email_propietario,
                notificado_60d, decision_renovacion
         FROM contratos
-        WHERE fecha_fin IS NOT NULL
+        WHERE estado = 'ACTIVO'
+          AND fecha_fin IS NOT NULL
           AND notificado_60d = 0
           AND (email_inquilino IS NOT NULL OR email_propietario IS NOT NULL)
         ORDER BY fecha_fin ASC
@@ -372,8 +342,6 @@ def run_notifications_60d():
             continue
 
         dias = (fin - hoy).days
-
-        # solo contratos que vencen en el futuro dentro del umbral
         if not (0 <= dias <= umbral):
             saltados.append({"id": r.get("id"), "motivo": f"fuera_de_umbral ({dias})"})
             continue
@@ -407,11 +375,9 @@ def run_notifications_60d():
         )
 
         try:
-            # Enviar a todos los destinos
             for to in destinos:
                 send_email(to=to, subject=subject, body=body)
 
-            # Si salió OK, marcamos notificado
             ejecutar(
                 cur,
                 "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",
@@ -419,21 +385,13 @@ def run_notifications_60d():
                 (1, datetime.now(), r.get("id")),
             )
 
-            notificados.append({
-                "id": r.get("id"),
-                "dias_restantes": dias,
-                "destinos": destinos,
-            })
+            notificados.append({"id": r.get("id"), "dias_restantes": dias, "destinos": destinos})
 
         except Exception as e:
             saltados.append({"id": r.get("id"), "motivo": f"error_envio: {repr(e)}"})
             continue
 
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
+    conn.commit()
     cur.close()
     conn.close()
 
@@ -450,5 +408,4 @@ def run_notifications_60d():
 # Main
 # =========================================================
 if __name__ == "__main__":
-    # Un solo run, un solo puerto
     app.run(host="127.0.0.1", port=5000, debug=True)

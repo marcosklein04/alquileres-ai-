@@ -6,7 +6,7 @@ from datetime import date, datetime
 
 load_dotenv()
 
-DB_ENGINE = os.getenv("DB_ENGINE", "sqlite").lower()
+DB_ENGINE = os.getenv("DB_ENGINE", "postgres").lower()
 DB_PATH = os.getenv("DB_PATH", "contratos.db")
 
 
