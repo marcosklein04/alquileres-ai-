@@ -2,28 +2,26 @@ import os
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.message import EmailMessage
 
-def send_email(to_email: str, subject: str, html: str, text: str | None = None):
-    host = os.getenv("GMAIL_SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("GMAIL_SMTP_PORT", "587"))
-    user = os.getenv("GMAIL_SMTP_USER")
-    password = os.getenv("GMAIL_SMTP_PASS")
-    from_name = os.getenv("MAIL_FROM_NAME", "Alquileres AI")
+def send_email(to: str, subject: str, body: str):
+    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    user = os.getenv("SMTP_USER")
+    password = os.getenv("SMTP_PASS")
+    mail_from = os.getenv("MAIL_FROM", user)
 
     if not user or not password:
-        raise RuntimeError("Faltan credenciales SMTP: GMAIL_SMTP_USER / GMAIL_SMTP_PASS")
+        raise RuntimeError("Faltan SMTP_USER / SMTP_PASS en variables de entorno")
 
-    msg = MIMEMultipart("alternative")
+    msg = EmailMessage()
+    msg["From"] = mail_from
+    msg["To"] = to
     msg["Subject"] = subject
-    msg["From"] = f"{from_name} <{user}>"
-    msg["To"] = to_email
+    msg.set_content(body)
 
-    if text:
-        msg.attach(MIMEText(text, "plain", "utf-8"))
-    msg.attach(MIMEText(html, "html", "utf-8"))
-
-    with smtplib.SMTP(host, port) as server:
-        server.ehlo()
-        server.starttls()
-        server.login(user, password)
-        server.sendmail(user, [to_email], msg.as_string())
+    with smtplib.SMTP(host, port) as smtp:
+        smtp.ehlo()
+        smtp.starttls()
+        smtp.login(user, password)
+        smtp.send_message(msg)

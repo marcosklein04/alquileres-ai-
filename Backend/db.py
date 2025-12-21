@@ -4,23 +4,18 @@ import pymysql
 from dotenv import load_dotenv
 from datetime import date, datetime
 
-import pymysql
-
-def get_db_connection():
-    return pymysql.connect(
-        host="localhost",
-        user="alquileres_user",
-        password="alquileres123",
-        database="alquileres_ai",
-        cursorclass=pymysql.cursors.DictCursor,
-        autocommit=True
-    )
-
 load_dotenv()
 
 DB_ENGINE = os.getenv("DB_ENGINE", "sqlite").lower()
+DB_PATH = os.getenv("DB_PATH", "contratos.db")
 
-def get_connection():
+
+def get_db_connection():
+    """
+    Devuelve conexión según DB_ENGINE.
+    - mysql: usa pymysql con DictCursor
+    - sqlite: usa sqlite3 con row_factory=Row
+    """
     if DB_ENGINE == "mysql":
         return pymysql.connect(
             host=os.getenv("DB_HOST", "localhost"),
@@ -29,42 +24,19 @@ def get_connection():
             password=os.getenv("DB_PASSWORD", ""),
             database=os.getenv("DB_NAME", "alquileres_ai"),
             cursorclass=pymysql.cursors.DictCursor,
-            autocommit=True,
+            autocommit=False,  # commit manual (más control)
         )
-    else:
-        conn = sqlite3.connect("contratos.db")
-        conn.row_factory = sqlite3.Row
-        return conn
 
-def get_db_connection():
-    return get_connection()
-
-
-DB_PATH = "contratos.db"
-
-def listar_contratos_bd():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
+    return conn
 
-    # AJUSTÁ el nombre de la tabla si es distinto
-    cur.execute("""
-        SELECT
-            id,
-            inmobiliaria,
-            inquilino,
-            propietario,
-            fecha_inicio,
-            fecha_fin
-        FROM contracts
-        ORDER BY id DESC
-    """)
-
-    rows = cur.fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
 
 def listar_contratos_bd():
+    """
+    Devuelve lista de dicts con fechas en ISO (YYYY-MM-DD o None).
+    Tabla: contratos
+    """
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -74,16 +46,17 @@ def listar_contratos_bd():
         FROM contratos
         ORDER BY fecha_fin ASC
     """)
+
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
     items = []
     for r in rows:
+        # sqlite Row o dict mysql
         fi = r["fecha_inicio"]
         ff = r["fecha_fin"]
 
-        # normalizar a string ISO
         if isinstance(fi, date):
             fi = fi.isoformat()
         elif fi is not None:
@@ -107,29 +80,29 @@ def listar_contratos_bd():
 
     return items
 
+
 def listar_contratos_por_notificar_60d():
+    """
+    Trae contratos candidatos para aviso:
+    - estado ACTIVO
+    - notificado_60d = 0
+    - fecha_fin no null
+    - al menos un email (inquilino o propietario)
+    - días restantes dentro del umbral (dias_aviso)
+    """
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Trae contratos activos NO notificados aún
-    ejecutar(
-        cur,
-        """
+    cur.execute("""
         SELECT id, inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin,
                dias_aviso, decision_renovacion, email_inquilino, email_propietario, notificado_60d
         FROM contratos
-        WHERE estado='ACTIVO' AND notificado_60d=0
+        WHERE estado = 'ACTIVO'
+          AND notificado_60d = 0
+          AND fecha_fin IS NOT NULL
+          AND (email_inquilino IS NOT NULL OR email_propietario IS NOT NULL)
         ORDER BY fecha_fin ASC
-        """,
-        """
-        SELECT id, inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin,
-               dias_aviso, decision_renovacion, email_inquilino, email_propietario, notificado_60d
-        FROM contratos
-        WHERE estado='ACTIVO' AND notificado_60d=0
-        ORDER BY fecha_fin ASC
-        """,
-        ()
-    )
+    """)
 
     rows = cur.fetchall()
     cur.close()
@@ -140,24 +113,36 @@ def listar_contratos_por_notificar_60d():
 
     for r in rows:
         fin = r["fecha_fin"]
-        dias = (fin - hoy).days if fin else None
-        umbral = r.get("dias_aviso", 60) if isinstance(r, dict) else 60
 
-        requiere = dias is not None and 0 <= dias <= int(umbral)
+        # fin puede venir como date (mysql) o string (sqlite)
+        if isinstance(fin, date):
+            fin_date = fin
+        else:
+            try:
+                fin_date = datetime.strptime(str(fin), "%Y-%m-%d").date()
+            except Exception:
+                fin_date = None
 
-        if requiere:
+        if not fin_date:
+            continue
+
+        dias = (fin_date - hoy).days
+        umbral = r.get("dias_aviso", 60) if isinstance(r, dict) else r["dias_aviso"]
+        umbral = int(umbral or 60)
+
+        if 0 <= dias <= umbral:
             out.append({
                 "id": r["id"],
                 "inmobiliaria": r["inmobiliaria"],
                 "inquilino": r["inquilino"],
                 "propietario": r["propietario"],
                 "fecha_inicio": str(r["fecha_inicio"]) if r["fecha_inicio"] else None,
-                "fecha_fin": str(r["fecha_fin"]) if r["fecha_fin"] else None,
-                "dias_aviso": int(umbral),
+                "fecha_fin": fin_date.isoformat(),
+                "dias_aviso": umbral,
                 "dias_restantes": dias,
                 "decision_renovacion": r["decision_renovacion"],
-                "email_inquilino": r.get("email_inquilino"),
-                "email_propietario": r.get("email_propietario"),
+                "email_inquilino": r.get("email_inquilino") if isinstance(r, dict) else r["email_inquilino"],
+                "email_propietario": r.get("email_propietario") if isinstance(r, dict) else r["email_propietario"],
             })
 
     return out
@@ -167,17 +152,17 @@ def marcar_notificado_60d(contrato_id: int):
     conn = get_db_connection()
     cur = conn.cursor()
 
-    ejecutar(
-        cur,
-        "UPDATE contratos SET notificado_60d=1, notificado_60d_at=NOW() WHERE id=%s",
-        "UPDATE contratos SET notificado_60d=1, notificado_60d_at=datetime('now') WHERE id=?",
-        (contrato_id,)
-    )
+    if DB_ENGINE == "mysql":
+        cur.execute(
+            "UPDATE contratos SET notificado_60d=1, notificado_60d_at=NOW() WHERE id=%s",
+            (contrato_id,)
+        )
+    else:
+        cur.execute(
+            "UPDATE contratos SET notificado_60d=1, notificado_60d_at=datetime('now') WHERE id=?",
+            (contrato_id,)
+        )
 
-    try:
-        conn.commit()
-    except Exception:
-        pass
-
+    conn.commit()
     cur.close()
     conn.close()
