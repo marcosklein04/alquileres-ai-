@@ -86,6 +86,13 @@ def ping():
 @app.route("/api/contracts", methods=["POST"])
 def crear_contrato():
     from ai import extraer_datos_contrato
+    try:
+        from ai import extraer_datos_contrato
+    except Exception as e:
+        return jsonify({
+            "error": "No se pudo cargar el motor de IA (dependencias faltantes).",
+            "detalle": repr(e)
+        }), 500
 
     data = request.get_json() or {}
     texto_contrato = data.get("texto_contrato")
