@@ -11,13 +11,36 @@ CORS(app)
 
 
 # =========================================================
-# Helper SQL (mysql/sqlite placeholders)
+# Helpers SQL (mysql/postgres/sqlite placeholders + RETURNING)
 # =========================================================
 def ejecutar(cur, sql_mysql, sql_sqlite, params):
+    """
+    - MySQL: %s
+    - Postgres (psycopg2): %s
+    - SQLite: ?
+    """
     if DB_ENGINE == "mysql":
+        cur.execute(sql_mysql, params)
+    elif DB_ENGINE in ("postgres", "postgresql"):
         cur.execute(sql_mysql, params)
     else:
         cur.execute(sql_sqlite, params)
+
+
+def insert_and_get_id(cur, sql_mysql, sql_sqlite, params):
+    """
+    Inserta y devuelve el id creado.
+    - Postgres: usa RETURNING id
+    - MySQL/SQLite: usa lastrowid
+    """
+    if DB_ENGINE in ("postgres", "postgresql"):
+        sql_pg = sql_mysql.strip().rstrip(";") + " RETURNING id"
+        cur.execute(sql_pg, params)
+        row = cur.fetchone()
+        return row[0] if row else None
+
+    ejecutar(cur, sql_mysql, sql_sqlite, params)
+    return getattr(cur, "lastrowid", None)
 
 
 # =========================================================
@@ -26,7 +49,7 @@ def ejecutar(cur, sql_mysql, sql_sqlite, params):
 def _parse_iso_date(d):
     """
     d puede ser:
-    - date/datetime (MySQL)
+    - date/datetime (MySQL/Postgres)
     - string 'YYYY-MM-DD' (SQLite o serializado)
     - None
     """
@@ -85,7 +108,6 @@ def ping():
 # =========================================================
 @app.route("/api/contracts", methods=["POST"])
 def crear_contrato():
-    from ai import extraer_datos_contrato
     try:
         from ai import extraer_datos_contrato
     except Exception as e:
@@ -140,10 +162,10 @@ def crear_contrato():
         extraidos.get("fecha_inicio"),
         extraidos.get("fecha_fin"),
     )
-    ejecutar(cur, sql_mysql, sql_sqlite, params)
+
+    contrato_id = insert_and_get_id(cur, sql_mysql, sql_sqlite, params)
 
     conn.commit()
-    contrato_id = cur.lastrowid
     cur.close()
     conn.close()
 
@@ -257,10 +279,9 @@ def crear_contrato_manual():
         data.get("email_propietario"),
     )
 
-    ejecutar(cur, sql_mysql, sql_sqlite, params)
+    contrato_id = insert_and_get_id(cur, sql_mysql, sql_sqlite, params)
 
     conn.commit()
-    contrato_id = cur.lastrowid
     cur.close()
     conn.close()
 
@@ -326,18 +347,33 @@ def run_notifications_60d():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Nota: agrego estado='ACTIVO' para no notificar cosas dadas de baja
-    cur.execute("""
-        SELECT id, inquilino, propietario, fecha_fin,
-               email_inquilino, email_propietario,
-               notificado_60d, decision_renovacion
-        FROM contratos
-        WHERE estado = 'ACTIVO'
-          AND fecha_fin IS NOT NULL
-          AND notificado_60d = 0
-          AND (email_inquilino IS NOT NULL OR email_propietario IS NOT NULL)
-        ORDER BY fecha_fin ASC
-    """)
+    # Ajuste por motor: Postgres usa boolean TRUE/FALSE; SQLite suele usar 0/1
+    if DB_ENGINE in ("postgres", "postgresql"):
+        sql_select = """
+            SELECT id, inquilino, propietario, fecha_fin,
+                   email_inquilino, email_propietario,
+                   notificado_60d, decision_renovacion
+            FROM contratos
+            WHERE estado = 'ACTIVO'
+              AND fecha_fin IS NOT NULL
+              AND notificado_60d = FALSE
+              AND (email_inquilino IS NOT NULL OR email_propietario IS NOT NULL)
+            ORDER BY fecha_fin ASC
+        """
+    else:
+        sql_select = """
+            SELECT id, inquilino, propietario, fecha_fin,
+                   email_inquilino, email_propietario,
+                   notificado_60d, decision_renovacion
+            FROM contratos
+            WHERE estado = 'ACTIVO'
+              AND fecha_fin IS NOT NULL
+              AND notificado_60d = 0
+              AND (email_inquilino IS NOT NULL OR email_propietario IS NOT NULL)
+            ORDER BY fecha_fin ASC
+        """
+
+    cur.execute(sql_select)
     rows = cur.fetchall()
 
     notificados = []
@@ -361,9 +397,9 @@ def run_notifications_60d():
 
         destinos = []
         if r.get("email_inquilino"):
-            destinos.append(r["email_inquilino"])
+            destinos.append(r.get("email_inquilino"))
         if r.get("email_propietario"):
-            destinos.append(r["email_propietario"])
+            destinos.append(r.get("email_propietario"))
 
         if not destinos:
             saltados.append({"id": r.get("id"), "motivo": "sin_emails"})
@@ -390,7 +426,7 @@ def run_notifications_60d():
                 cur,
                 "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",
                 "UPDATE contratos SET notificado_60d = ?, notificado_60d_at = ? WHERE id = ?",
-                (1, datetime.now(), r.get("id")),
+                (True if DB_ENGINE in ("postgres", "postgresql") else 1, datetime.now(), r.get("id")),
             )
 
             notificados.append({"id": r.get("id"), "dias_restantes": dias, "destinos": destinos})
