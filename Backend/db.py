@@ -4,20 +4,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_ENGINE = os.getenv("DB_ENGINE", "").lower().strip()  # "postgres" | "mysql" | "sqlite"
-DATABASE_URL = os.getenv("DATABASE_URL")  # Railway Postgres
+DB_ENGINE = os.getenv("DB_ENGINE", "sqlite").lower()
+DB_PATH = os.getenv("DB_PATH", "contratos.db")
 
-def get_db_connection():
-    """
-    Prioridad:
-    1) Si existe DATABASE_URL => Postgres (Railway)
-    2) Si DB_ENGINE == mysql => MySQL
-    3) Caso contrario => SQLite local
-    """
-    if DATABASE_URL:
+def get_connection():
+    if DB_ENGINE in ("postgres", "postgresql"):
         import psycopg2
         import psycopg2.extras
-        return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+        database_url = os.getenv("DATABASE_URL")
+        if not database_url:
+            raise RuntimeError("Falta DATABASE_URL para Postgres")
+        return psycopg2.connect(database_url, cursor_factory=psycopg2.extras.RealDictCursor)
 
     if DB_ENGINE == "mysql":
         import pymysql
@@ -28,36 +25,13 @@ def get_db_connection():
             password=os.getenv("DB_PASSWORD", ""),
             database=os.getenv("DB_NAME", "alquileres_ai"),
             cursorclass=pymysql.cursors.DictCursor,
-            autocommit=False,
+            autocommit=True,
         )
 
-    conn = sqlite3.connect("contratos.db")
+    # sqlite por default
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
-
-def listar_contratos_bd():
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, inmobiliaria, inquilino, propietario,
-               fecha_inicio, fecha_fin, decision_renovacion, dias_aviso
-        FROM contratos
-        ORDER BY fecha_fin ASC
-    """)
-    rows = cur.fetchall()
-
-    cur.close()
-    conn.close()
-
-    # Normalizamos a dict/strings
-    out = []
-    for r in rows:
-        rr = dict(r)
-        fi = rr.get("fecha_inicio")
-        ff = rr.get("fecha_fin")
-        rr["fecha_inicio"] = fi.isoformat() if hasattr(fi, "isoformat") else (str(fi) if fi is not None else None)
-        rr["fecha_fin"] = ff.isoformat() if hasattr(ff, "isoformat") else (str(ff) if ff is not None else None)
-        out.append(rr)
-    return out
+def get_db_connection():
+    return get_connection()

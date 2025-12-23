@@ -1,45 +1,41 @@
 import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 from datetime import datetime, date
 
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
 from db import get_db_connection, DB_ENGINE
-from mailer import send_email  # SMTP: usa SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/MAIL_FROM
+from mailer import send_email  # SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS/MAIL_FROM
 
 app = Flask(__name__)
 CORS(app)
 
 
 # =========================================================
-# Helpers SQL (mysql/postgres/sqlite placeholders + RETURNING)
+# SQL helpers (MySQL / Postgres / SQLite)
 # =========================================================
-def ejecutar(cur, sql_mysql, sql_sqlite, params):
-    """
-    - MySQL: %s
-    - Postgres (psycopg2): %s
-    - SQLite: ?
-    """
+def ejecutar(cur, sql_mysql, sql_pg, sql_sqlite, params=()):
     if DB_ENGINE == "mysql":
         cur.execute(sql_mysql, params)
     elif DB_ENGINE in ("postgres", "postgresql"):
-        cur.execute(sql_mysql, params)
+        cur.execute(sql_pg, params)
     else:
         cur.execute(sql_sqlite, params)
 
 
-def insert_and_get_id(cur, sql_mysql, sql_sqlite, params):
+def insert_and_get_id(cur, sql_mysql, sql_pg, sql_sqlite, params=()):
     """
-    Inserta y devuelve el id creado.
+    Inserta y devuelve id.
     - Postgres: usa RETURNING id
     - MySQL/SQLite: usa lastrowid
     """
-    if DB_ENGINE in ("postgres", "postgresql"):
-        sql_pg = sql_mysql.strip().rstrip(";") + " RETURNING id"
-        cur.execute(sql_pg, params)
-        row = cur.fetchone()
-        return row[0] if row else None
+    ejecutar(cur, sql_mysql, sql_pg, sql_sqlite, params)
 
-    ejecutar(cur, sql_mysql, sql_sqlite, params)
+    if DB_ENGINE in ("postgres", "postgresql"):
+        row = cur.fetchone()
+        # RealDictCursor -> {"id": ...}
+        return row["id"] if isinstance(row, dict) else row[0]
+
     return getattr(cur, "lastrowid", None)
 
 
@@ -47,12 +43,6 @@ def insert_and_get_id(cur, sql_mysql, sql_sqlite, params):
 # Helpers fecha/estado
 # =========================================================
 def _parse_iso_date(d):
-    """
-    d puede ser:
-    - date/datetime (MySQL/Postgres)
-    - string 'YYYY-MM-DD' (SQLite o serializado)
-    - None
-    """
     if not d:
         return None
 
@@ -111,10 +101,7 @@ def crear_contrato():
     try:
         from ai import extraer_datos_contrato
     except Exception as e:
-        return jsonify({
-            "error": "No se pudo cargar el motor de IA (dependencias faltantes).",
-            "detalle": repr(e)
-        }), 500
+        return jsonify({"error": "No se pudo cargar el motor de IA.", "detalle": repr(e)}), 500
 
     data = request.get_json() or {}
     texto_contrato = data.get("texto_contrato")
@@ -134,12 +121,11 @@ def crear_contrato():
         res = extraer_datos_contrato(texto_contrato) or res
         extraidos = res.get("data") or extraidos
     except Exception as e:
-        print("❌ Error IA:", repr(e))
+        return jsonify({"error": "Error en IA", "detalle": repr(e)}), 500
 
-    # si no extrajo nada, no insertamos
     if (not res.get("ok")) or all(extraidos.get(k) is None for k in extraidos.keys()):
         return jsonify({
-            "error": "La IA no pudo extraer datos del contrato. Revisar texto o API Key.",
+            "error": "La IA no pudo extraer datos del contrato.",
             "ia_ok": res.get("ok"),
             "ia_modelo": res.get("model"),
         }), 422
@@ -150,6 +136,11 @@ def crear_contrato():
     sql_mysql = """
         INSERT INTO contratos (inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin)
         VALUES (%s, %s, %s, %s, %s)
+    """
+    sql_pg = """
+        INSERT INTO contratos (inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin)
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id
     """
     sql_sqlite = """
         INSERT INTO contratos (inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin)
@@ -163,9 +154,9 @@ def crear_contrato():
         extraidos.get("fecha_fin"),
     )
 
-    contrato_id = insert_and_get_id(cur, sql_mysql, sql_sqlite, params)
-
+    contrato_id = insert_and_get_id(cur, sql_mysql, sql_pg, sql_sqlite, params)
     conn.commit()
+
     cur.close()
     conn.close()
 
@@ -192,6 +183,7 @@ def listar_contratos():
         ORDER BY fecha_fin ASC
     """)
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
@@ -226,7 +218,7 @@ def actualizar_renovacion(contrato_id):
     data = request.get_json() or {}
     decision = data.get("decision")
 
-    if decision not in ["RENUEVA", "NO_RENUEVA"]:
+    if decision not in ("RENUEVA", "NO_RENUEVA"):
         return jsonify({"error": "decision inválida"}), 400
 
     conn = get_db_connection()
@@ -234,8 +226,9 @@ def actualizar_renovacion(contrato_id):
 
     ejecutar(
         cur,
-        "UPDATE contratos SET decision_renovacion = %s WHERE id = %s",
-        "UPDATE contratos SET decision_renovacion = ? WHERE id = ?",
+        "UPDATE contratos SET decision_renovacion = %s WHERE id = %s",  # mysql
+        "UPDATE contratos SET decision_renovacion = %s WHERE id = %s",  # pg
+        "UPDATE contratos SET decision_renovacion = ? WHERE id = ?",    # sqlite
         (decision, contrato_id),
     )
 
@@ -262,6 +255,13 @@ def crear_contrato_manual():
             email_inquilino, email_propietario
         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
+    sql_pg = """
+        INSERT INTO contratos (
+            inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin, dias_aviso,
+            email_inquilino, email_propietario
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """
     sql_sqlite = """
         INSERT INTO contratos (
             inmobiliaria, inquilino, propietario, fecha_inicio, fecha_fin, dias_aviso,
@@ -279,7 +279,7 @@ def crear_contrato_manual():
         data.get("email_propietario"),
     )
 
-    contrato_id = insert_and_get_id(cur, sql_mysql, sql_sqlite, params)
+    contrato_id = insert_and_get_id(cur, sql_mysql, sql_pg, sql_sqlite, params)
 
     conn.commit()
     cur.close()
@@ -311,6 +311,7 @@ def listar_contratos_enriquecidos():
         ORDER BY fecha_fin ASC
     """)
     rows = cur.fetchall()
+
     cur.close()
     conn.close()
 
@@ -337,7 +338,6 @@ def listar_contratos_enriquecidos():
 
 # =========================================================
 # POST /api/notifications/run-60d
-# Envía mail y marca notificado_60d solo si envía OK
 # =========================================================
 @app.route("/api/notifications/run-60d", methods=["POST"])
 def run_notifications_60d():
@@ -347,7 +347,6 @@ def run_notifications_60d():
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # Ajuste por motor: Postgres usa boolean TRUE/FALSE; SQLite suele usar 0/1
     if DB_ENGINE in ("postgres", "postgresql"):
         sql_select = """
             SELECT id, inquilino, propietario, fecha_fin,
@@ -390,7 +389,6 @@ def run_notifications_60d():
             saltados.append({"id": r.get("id"), "motivo": f"fuera_de_umbral ({dias})"})
             continue
 
-        # si ya decidió, no avisar
         if r.get("decision_renovacion") not in (None, "PENDIENTE"):
             saltados.append({"id": r.get("id"), "motivo": f"decision_renovacion={r.get('decision_renovacion')}"})
             continue
@@ -424,8 +422,9 @@ def run_notifications_60d():
 
             ejecutar(
                 cur,
-                "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",
-                "UPDATE contratos SET notificado_60d = ?, notificado_60d_at = ? WHERE id = ?",
+                "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",  # mysql
+                "UPDATE contratos SET notificado_60d = %s, notificado_60d_at = %s WHERE id = %s",  # pg
+                "UPDATE contratos SET notificado_60d = ?, notificado_60d_at = ? WHERE id = ?",     # sqlite
                 (True if DB_ENGINE in ("postgres", "postgresql") else 1, datetime.now(), r.get("id")),
             )
 
