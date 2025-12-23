@@ -1,27 +1,37 @@
 import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.message import EmailMessage
+import requests
+
 
 def send_email(to: str, subject: str, body: str):
-    host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    port = int(os.getenv("SMTP_PORT", "587"))
-    user = os.getenv("SMTP_USER")
-    password = os.getenv("SMTP_PASS")
-    mail_from = os.getenv("MAIL_FROM", user)
+    provider = os.getenv("EMAIL_PROVIDER", "resend").lower()
 
-    if not user or not password:
-        raise RuntimeError("Faltan SMTP_USER / SMTP_PASS en variables de entorno")
+    if provider != "resend":
+        raise RuntimeError("EMAIL_PROVIDER no soportado. Usá EMAIL_PROVIDER=resend")
 
-    msg = EmailMessage()
-    msg["From"] = mail_from
-    msg["To"] = to
-    msg["Subject"] = subject
-    msg.set_content(body)
+    api_key = os.getenv("RESEND_API_KEY")
+    mail_from = os.getenv("MAIL_FROM", "onboarding@resend.dev")
+    mail_from_name = os.getenv("MAIL_FROM_NAME", "Alquileres AI")
 
-    with smtplib.SMTP(host, port) as smtp:
-        smtp.ehlo()
-        smtp.starttls()
-        smtp.login(user, password)
-        smtp.send_message(msg)
+    if not api_key:
+        raise RuntimeError("Falta RESEND_API_KEY en variables de entorno")
+
+    # Resend acepta From en formato "Nombre <email>"
+    from_header = f"{mail_from_name} <{mail_from}>" if mail_from_name else mail_from
+
+    url = "https://api.resend.com/emails"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "from": from_header,
+        "to": [to],
+        "subject": subject,
+        # Para mantenerlo simple: body texto plano
+        "text": body,
+    }
+
+    resp = requests.post(url, headers=headers, json=payload, timeout=30)
+
+    if resp.status_code >= 300:
+        raise RuntimeError(f"Resend error {resp.status_code}: {resp.text}")
